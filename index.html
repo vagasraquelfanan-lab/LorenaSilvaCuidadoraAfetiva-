@@ -518,6 +518,7 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .passos-token { padding-left: 1.3rem; display: grid; gap: 6px; }
 .pequeno { font-size: .86rem; margin-top: 12px; }
 .cartao-area .eyebrow { display: block; width: fit-content; }
+.cartao-area > summary { cursor: pointer; font-weight: 800; color: var(--azul); font-family: var(--display); font-size: 1.1rem; }
 .sucesso > h2 { justify-content: center; }
 .toast { bottom: calc(24px + env(safe-area-inset-bottom, 0px)); z-index: 90; }
 </style>
@@ -790,12 +791,6 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 <script>
 /* ====== CONFIGURAÇÃO DO SITE (pode editar aqui) ====== */
 window.CONFIG_SITE = {
-   github: {
-  dono: 'vagasraquelfanan-lab',
-  repositorio: 'LorenaSilvaCuidadoraAfetiva-',
-  ramo: 'main',
-  arquivo: 'agenda.json'
-}
   nome: 'Lorena Silva · Cuidadora Afetiva',
   cidade: 'Franca/SP',
   whatsapp: '16991531529',
@@ -805,10 +800,11 @@ window.CONFIG_SITE = {
   // 0 = domingo ... 6 = sábado. [abre, fecha] em horas cheias; null = sem atendimento
   horarioSemana: { 0: null, 1: [7, 20], 2: [7, 20], 3: [7, 20], 4: [7, 20], 5: [7, 20], 6: [8, 14] },
   github: {
-    dono: '',          // deixe vazio: no endereço ...github.io o site descobre sozinho
-    repositorio: '',   // deixe vazio: no endereço ...github.io o site descobre sozinho
-    ramo: 'main',      // ramo publicado pelo GitHub Pages
-    arquivo: 'agenda.json'
+    dono: 'vagasraquelfanan-lab',               // usuário do GitHub
+    repositorio: 'LorenaSilvaCuidadoraAfetiva-', // nome do repositório
+    ramo: 'main',                                // ramo publicado pelo GitHub Pages
+    arquivo: 'agenda.json',
+    arquivoAcesso: 'acesso.json'                 // guarda o acesso trancado com a senha (criado pelo próprio site)
   }
 };
 </script>
@@ -1173,8 +1169,89 @@ window.CONFIG_SITE = {
     }
     return null;
   }
-  function token() { try { return localStorage.getItem(CHAVE_TOKEN) || ''; } catch (e) { return ''; } }
-  function guardarToken(t) { try { if (t) localStorage.setItem(CHAVE_TOKEN, t); else localStorage.removeItem(CHAVE_TOKEN); } catch (e) { /* sem armazenamento */ } }
+  // O token só existe aberto na memória desta aba, depois que a Lorena digita a senha.
+  var tokenAberto = '';
+  try { tokenAberto = sessionStorage.getItem(CHAVE_TOKEN) || ''; } catch (e) { /* sem armazenamento */ }
+  function token() { return tokenAberto; }
+  function guardarToken(t) {
+    tokenAberto = t || '';
+    try { if (t) sessionStorage.setItem(CHAVE_TOKEN, t); else sessionStorage.removeItem(CHAVE_TOKEN); } catch (e) { /* sem armazenamento */ }
+    try { localStorage.removeItem(CHAVE_TOKEN); } catch (e) { /* limpa versões antigas */ }
+  }
+
+  // ---------- senha da Lorena: o token fica guardado no repositório, criptografado ----------
+  // acesso.json = { v, iter, salt, iv, dados }  (AES-GCM 256 com chave derivada da senha por PBKDF2-SHA256)
+  var ITERACOES = 600000;
+  var bytesB64 = function (u8) { var s = ''; u8.forEach(function (b) { s += String.fromCharCode(b); }); return btoa(s); };
+  var b64Bytes = function (t) { var s = atob(t), u = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
+  function cripto() {
+    if (!window.crypto || !crypto.subtle) throw erro(0, 'Este navegador não permite a área protegida. Abra o site pelo endereço https do GitHub Pages.');
+    return crypto.subtle;
+  }
+  async function chaveDaSenha(senha, salt, iter) {
+    var sub = cripto();
+    var base = await sub.importKey('raw', new TextEncoder().encode(senha), 'PBKDF2', false, ['deriveKey']);
+    return sub.deriveKey({ name: 'PBKDF2', salt: salt, iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+  async function trancar(tk, senha) {
+    var salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    var chave = await chaveDaSenha(senha, salt, ITERACOES);
+    var cifra = new Uint8Array(await cripto().encrypt({ name: 'AES-GCM', iv: iv }, chave, new TextEncoder().encode(tk)));
+    return { v: 1, iter: ITERACOES, salt: bytesB64(salt), iv: bytesB64(iv), dados: bytesB64(cifra) };
+  }
+  async function destrancar(acesso, senha) {
+    var chave = await chaveDaSenha(senha, b64Bytes(acesso.salt), acesso.iter || ITERACOES);
+    try {
+      var claro = await cripto().decrypt({ name: 'AES-GCM', iv: b64Bytes(acesso.iv) }, chave, b64Bytes(acesso.dados));
+      return new TextDecoder().decode(claro);
+    } catch (e) { throw erro(401, 'Senha incorreta.'); }
+  }
+  /** Lê o acesso.json publicado. null = a área ainda não foi configurada. */
+  async function lerAcesso() {
+    try {
+      var r = await fetch(CONF.github.arquivoAcesso + '?v=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) return null;
+      var j = await r.json();
+      return j && j.dados && j.salt && j.iv ? j : null;
+    } catch (e) { return null; }
+  }
+  async function gravarArquivo(caminho, conteudo, mensagem, tk) {
+    var g = CONF.github;
+    var atual = await gh('/contents/' + caminho + '?ref=' + encodeURIComponent(g.ramo) + '&t=' + Date.now(), { method: 'GET' }, tk);
+    var sha = atual.ok ? (await atual.json()).sha : null;
+    var corpo = { message: mensagem, content: b64(conteudo), branch: g.ramo };
+    if (sha) corpo.sha = sha;
+    var res = await gh('/contents/' + caminho, { method: 'PUT', body: JSON.stringify(corpo) }, tk);
+    if (!res.ok) throw erro(res.status, 'O GitHub não aceitou salvar (erro ' + res.status + '). Confira se o token tem "Contents: Read and write".');
+  }
+  var ultimoAcesso = null;
+  /** Lorena digita a senha: abre o token guardado e libera a área. */
+  async function entrar(senha) {
+    var acesso = await lerAcesso();
+    if (!acesso) throw erro(404, 'A área da cuidadora ainda não foi configurada.');
+    var tk = await destrancar(acesso, senha);
+    guardarToken(tk);
+    ultimoAcesso = acesso;
+    return true;
+  }
+  /** Primeira configuração (ou troca de token): testa o token, tranca com a senha e salva no repositório. */
+  async function configurar(tk, senha) {
+    if (String(senha).length < 8) throw erro(400, 'A senha precisa ter pelo menos 8 caracteres.');
+    await testarToken(tk);
+    var acesso = await trancar(tk, senha);
+    await gravarArquivo(CONF.github.arquivoAcesso, JSON.stringify(acesso, null, 2) + '\n', 'Configura acesso da área da cuidadora', tk);
+    guardarToken(tk);
+    ultimoAcesso = acesso;
+  }
+  async function trocarSenha(atual, nova) {
+    if (String(nova).length < 8) throw erro(400, 'A nova senha precisa ter pelo menos 8 caracteres.');
+    var acesso = await lerAcesso();
+    if (!acesso) throw erro(404, 'A área ainda não foi configurada.');
+    var tk = await destrancar(acesso, atual);
+    var novo = await trancar(tk, nova);
+    await gravarArquivo(CONF.github.arquivoAcesso, JSON.stringify(novo, null, 2) + '\n', 'Troca a senha da área da cuidadora', tk);
+    guardarToken(tk);
+  }
 
   function b64(str) { return btoa(unescape(encodeURIComponent(str))); }
   function deB64(s) { return decodeURIComponent(escape(atob(String(s).replace(/\s/g, '')))); }
@@ -1265,6 +1342,7 @@ window.CONFIG_SITE = {
     codificar: codificar, decodificar: decodificar, carregarPublico: carregarPublico,
     estado: function () { return estado; }, repositorio: repositorio,
     token: token, guardarToken: guardarToken, testarToken: testarToken,
+    lerAcesso: lerAcesso, entrar: entrar, configurar: configurar, trocarSenha: trocarSenha,
     lerRemoto: lerRemoto, confirmar: confirmar, recusar: recusar, cancelar: cancelar, conflitos: conflitos,
     epoca: epoca, hoje: hoje
   };
@@ -1716,39 +1794,114 @@ window.CONFIG_SITE = {
   }
 
   // ---------------- Lorena: área da cuidadora ----------------
-  function telaConectar(depois) {
+  function campoSenha(rotulo, id, auto) {
+    var lab = el('label', 'campo', rotulo); lab.style.marginTop = '14px';
+    var inp = el('input'); inp.type = 'password'; inp.id = id; inp.autocomplete = auto || 'current-password';
+    lab.appendChild(inp); return { lab: lab, inp: inp };
+  }
+
+  /** Lorena entra com a senha dela. */
+  async function telaEntrar(depois) {
     conteudo.innerHTML = '';
     var c = el('div', 'cartao-area');
     c.appendChild(el('div', 'eyebrow', 'área da cuidadora'));
-    c.appendChild(el('h2', null, 'Conectar este aparelho'));
-    c.appendChild(el('p', null, 'Para confirmar pedidos e atualizar a agenda, este celular ou computador precisa de uma chave de acesso do GitHub. Você faz isso uma vez só em cada aparelho.'));
+    c.appendChild(el('h2', null, 'Entrar'));
+    var msg = el('div'); msg.setAttribute('aria-live', 'polite');
+    c.appendChild(msg);
+    conteudo.appendChild(c);
+    aviso(msg, 'Carregando…', 'info');
+    var acesso = await A.lerAcesso();
+    msg.innerHTML = '';
+    if (!acesso) return telaConfigurar(depois, false);
+
+    c.appendChild(el('p', null, 'Digite a sua senha para confirmar pedidos e cuidar da agenda.'));
+    var form = el('form'); form.noValidate = true;
+    var s = campoSenha('Senha', 'senha-lorena');
+    form.appendChild(s.lab);
+    var ok = el('button', 'btn', 'Entrar'); ok.type = 'submit'; ok.style.marginTop = '14px';
+    form.appendChild(ok);
+    form.onsubmit = async function (ev) {
+      ev.preventDefault();
+      if (!s.inp.value) return aviso(msg, 'Digite a senha.', 'erro');
+      ok.disabled = true; ok.textContent = 'Conferindo…';
+      try { await A.entrar(s.inp.value); s.inp.value = ''; depois(); }
+      catch (e) { aviso(msg, e.message, 'erro'); ok.disabled = false; ok.textContent = 'Entrar'; s.inp.select(); }
+    };
+    c.appendChild(form);
+    c.appendChild(msg);
+    var esqueci = el('p', 'muted pequeno', 'Esqueceu a senha? Quem tem acesso ao GitHub do site pode criar uma nova em ');
+    var lk = el('a', null, 'configurar de novo'); lk.href = '#cuidadora'; lk.onclick = function (e) { e.preventDefault(); telaConfigurar(depois, true); };
+    esqueci.appendChild(lk); esqueci.appendChild(document.createTextNode('.'));
+    c.appendChild(esqueci);
+    setTimeout(function () { s.inp.focus(); }, 50);
+  }
+
+  /** Configuração feita uma vez: liga o site ao GitHub e cria a senha da Lorena. */
+  function telaConfigurar(depois, refazendo) {
+    conteudo.innerHTML = '';
+    var c = el('div', 'cartao-area');
+    c.appendChild(el('div', 'eyebrow', 'área da cuidadora'));
+    c.appendChild(el('h2', null, refazendo ? 'Criar uma nova senha' : 'Configuração inicial'));
+    c.appendChild(el('p', null, 'Esta etapa é feita uma vez só, por quem administra o GitHub do site. Depois disso, a Lorena entra apenas com a senha criada aqui.'));
     var ol = el('ol', 'passos-token');
     [
-      'Entre no GitHub com a conta dona do site e abra: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.',
+      'No GitHub, abra: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.',
       'Em "Repository access", escolha "Only select repositories" e marque o repositório do site.',
       'Em "Permissions", procure "Contents" e escolha "Read and write".',
-      'Escolha a validade mais longa, gere o token, copie e cole abaixo.'
+      'Escolha a validade mais longa, gere o token e cole abaixo.'
     ].forEach(function (t) { ol.appendChild(el('li', null, t)); });
     c.appendChild(ol);
     var link = el('a', null, 'Abrir a página de tokens do GitHub →'); link.href = 'https://github.com/settings/personal-access-tokens/new'; link.target = '_blank'; link.rel = 'noopener';
     c.appendChild(link);
-    var lab = el('label', 'campo', 'Token do GitHub'); lab.style.marginTop = '16px';
-    var inp = el('input'); inp.type = 'password'; inp.id = 'token-github'; inp.autocomplete = 'off'; inp.placeholder = 'github_pat_...';
-    lab.appendChild(inp); c.appendChild(lab);
+    var form = el('form'); form.noValidate = true;
+    var lt = el('label', 'campo', 'Token do GitHub'); lt.style.marginTop = '16px';
+    var tk = el('input'); tk.type = 'password'; tk.id = 'token-github'; tk.autocomplete = 'off'; tk.placeholder = 'github_pat_...';
+    lt.appendChild(tk); form.appendChild(lt);
+    var s1 = campoSenha('Senha da Lorena (mínimo 8 caracteres)', 'senha-nova', 'new-password');
+    var s2 = campoSenha('Repita a senha', 'senha-nova-2', 'new-password');
+    form.appendChild(s1.lab); form.appendChild(s2.lab);
+    form.appendChild(el('p', 'muted pequeno', 'Dica de senha forte: junte 3 ou 4 palavras que só a Lorena associa, com algum número. Ex.: "girassol-praia-nina-27". Ela não fica salva em lugar nenhum: se esquecer, é só configurar de novo.'));
+    var ok = el('button', 'btn', 'Salvar e entrar'); ok.type = 'submit'; ok.style.marginTop = '8px';
+    form.appendChild(ok);
     var msg = el('div'); msg.setAttribute('aria-live', 'polite');
-    var ok = botao('Conectar', '', async function () {
-      var t = inp.value.trim();
-      if (!t) return aviso(msg, 'Cole o token antes de conectar.', 'erro');
-      ok.disabled = true; ok.textContent = 'Conferindo…';
-      try { await A.testarToken(t); A.guardarToken(t); App.toast('Aparelho conectado!'); depois(); }
-      catch (e) { aviso(msg, e.message, 'erro'); ok.disabled = false; ok.textContent = 'Conectar'; }
-    });
-    ok.style.marginTop = '14px';
-    c.appendChild(ok); c.appendChild(msg);
-    c.appendChild(el('p', 'muted pequeno', 'O token fica guardado só neste navegador e nunca aparece no site. Não envie o token para ninguém.'));
+    form.onsubmit = async function (ev) {
+      ev.preventDefault();
+      if (!tk.value.trim()) return aviso(msg, 'Cole o token do GitHub.', 'erro');
+      if (s1.inp.value.length < 8) return aviso(msg, 'A senha precisa ter pelo menos 8 caracteres.', 'erro');
+      if (s1.inp.value !== s2.inp.value) return aviso(msg, 'As duas senhas não são iguais.', 'erro');
+      ok.disabled = true; ok.textContent = 'Salvando…';
+      try {
+        await A.configurar(tk.value.trim(), s1.inp.value);
+        tk.value = s1.inp.value = s2.inp.value = '';
+        App.toast('Pronto! A partir de agora a Lorena entra só com a senha.');
+        depois();
+      } catch (e) { aviso(msg, e.message, 'erro'); ok.disabled = false; ok.textContent = 'Salvar e entrar'; }
+    };
+    c.appendChild(form); c.appendChild(msg);
     var rp = A.repositorio();
-    c.appendChild(el('p', 'muted pequeno', rp ? 'Repositório: ' + rp.dono + '/' + rp.repo : 'Atenção: abra o site pelo endereço do GitHub Pages (…github.io) ou preencha o repositório em CONFIG_SITE.'));
+    c.appendChild(el('p', 'muted pequeno', rp ? 'Repositório: ' + rp.dono + '/' + rp.repo : 'Atenção: preencha o repositório em CONFIG_SITE, no começo do arquivo.'));
+    if (refazendo) { var v = botao('← Voltar para entrar com a senha', 'btn-claro btn-sm', function () { telaEntrar(depois); }); v.style.marginTop = '10px'; c.appendChild(v); }
     conteudo.appendChild(c);
+  }
+
+  function trocarSenhaCartao() {
+    var c = el('details', 'cartao-area');
+    c.appendChild(el('summary', null, 'Trocar a senha'));
+    var a = campoSenha('Senha atual', 'senha-atual');
+    var n1 = campoSenha('Nova senha (mínimo 8 caracteres)', 'senha-troca', 'new-password');
+    var n2 = campoSenha('Repita a nova senha', 'senha-troca-2', 'new-password');
+    var msg = el('div');
+    var b = botao('Salvar nova senha', 'btn-sm', async function () {
+      if (n1.inp.value.length < 8) return aviso(msg, 'A nova senha precisa ter pelo menos 8 caracteres.', 'erro');
+      if (n1.inp.value !== n2.inp.value) return aviso(msg, 'As duas senhas novas não são iguais.', 'erro');
+      b.disabled = true;
+      try { await A.trocarSenha(a.inp.value, n1.inp.value); a.inp.value = n1.inp.value = n2.inp.value = ''; aviso(msg, 'Senha trocada. Use a nova senha a partir de agora.', 'ok'); }
+      catch (e) { aviso(msg, e.message, 'erro'); }
+      b.disabled = false;
+    });
+    b.style.marginTop = '12px';
+    [a.lab, n1.lab, n2.lab, b, msg].forEach(function (x) { c.appendChild(x); });
+    return c;
   }
 
   function mensagemFamilia(p) {
@@ -1758,7 +1911,7 @@ window.CONFIG_SITE = {
   }
 
   async function areaCuidadora(cod) {
-    if (!A.token()) return telaConectar(function () { areaCuidadora(cod); });
+    if (!A.token()) return telaEntrar(function () { areaCuidadora(cod); });
     conteudo.innerHTML = '';
     var topo = el('div', 'cartao-area');
     topo.appendChild(el('div', 'eyebrow', 'área da cuidadora'));
@@ -1772,7 +1925,11 @@ window.CONFIG_SITE = {
     try { remoto = await A.lerRemoto(); }
     catch (e) {
       aviso(status, e.message, 'erro');
-      if (e.status === 401) { A.guardarToken(''); topo.appendChild(botao('Conectar de novo', '', function () { telaConectar(function () { areaCuidadora(cod); }); })); }
+      if (e.status === 401) {
+        A.guardarToken('');
+        aviso(status, 'O acesso ao GitHub venceu. Quem administra o GitHub precisa gerar um token novo e configurar de novo (a senha pode continuar a mesma).', 'erro');
+        topo.appendChild(botao('Configurar de novo', '', function () { telaConfigurar(function () { areaCuidadora(cod); }, true); }));
+      }
       return;
     }
     status.innerHTML = '';
@@ -1814,7 +1971,8 @@ window.CONFIG_SITE = {
 
     var rodape = el('div', 'cartao-area discreto');
     rodape.appendChild(el('p', 'muted pequeno', 'Depois de cada confirmação, o GitHub leva cerca de 1 minuto para publicar a agenda nova para as famílias.'));
-    rodape.appendChild(botao('Desconectar este aparelho', 'btn-claro btn-sm', function () { A.guardarToken(''); App.toast('Aparelho desconectado.'); areaCuidadora(cod); }));
+    rodape.appendChild(botao('Sair', 'btn-claro btn-sm', function () { A.guardarToken(''); App.toast('Você saiu da área da cuidadora.'); fechar(); }));
+    conteudo.appendChild(trocarSenhaCartao());
     conteudo.appendChild(rodape);
   }
 
