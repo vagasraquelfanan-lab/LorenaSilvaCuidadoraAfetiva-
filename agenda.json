@@ -10,6 +10,11 @@
       "confirmadoEm": "2026-10-31T21:31:13.949Z"
     }
   ],
-  "recusados": [],
+  "recusados": [
+    {
+      "id": "j7vbsza",
+      "em": "2026-10-31T21:28:18.354Z"
+    }
+  ],
   "bloqueios": []
 }
